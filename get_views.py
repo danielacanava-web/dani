@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
 """
-Twitter/X View Count Scraper
+Twitter/X View Count Scraper — uses your existing browser profile
 Setup: pip install playwright && playwright install chromium
 
-How to get your auth_token:
-  1. Open x.com in Chrome (logged in)
-  2. DevTools (F12) → Application → Cookies → https://x.com
-  3. Copy the value of 'auth_token'
+IMPORTANT: Close your browser completely before running this script.
+           It will open a browser window using your existing profile (already logged in).
 """
 import asyncio
 import re
+import sys
+import os
+from pathlib import Path
 from playwright.async_api import async_playwright
-
-# ── PASTE YOUR auth_token VALUE HERE ─────────────────────────────────────────
-AUTH_TOKEN = "PASTE_HERE"
-# ─────────────────────────────────────────────────────────────────────────────
 
 URLS = [
     "https://x.com/cgtwts/status/2045212979294249322",
@@ -99,6 +96,31 @@ URLS = [
 ]
 
 
+def get_profile_path():
+    """Return (channel, user_data_dir) for the first Chrome/Edge installation found."""
+    if sys.platform == "darwin":
+        candidates = [
+            ("chrome", Path.home() / "Library/Application Support/Google/Chrome"),
+            ("msedge", Path.home() / "Library/Application Support/Microsoft Edge"),
+        ]
+    elif sys.platform == "win32":
+        local = Path(os.environ.get("LOCALAPPDATA", ""))
+        candidates = [
+            ("chrome", local / "Google/Chrome/User Data"),
+            ("msedge", local / "Microsoft/Edge/User Data"),
+        ]
+    else:
+        candidates = [
+            ("chrome", Path.home() / ".config/google-chrome"),
+            ("chrome", Path.home() / ".config/chromium"),
+            ("msedge", Path.home() / ".config/microsoft-edge"),
+        ]
+    for channel, path in candidates:
+        if path.exists():
+            return channel, str(path)
+    return None, None
+
+
 def parse_views(text):
     text = text.strip().replace(",", "")
     m = re.match(r"^([\d.]+)([KMB]?)$", text.upper())
@@ -111,14 +133,14 @@ def parse_views(text):
 
 JS_EXTRACT = """
 () => {
-    // Strategy 1: analytics link text (e.g. "137.3K Views")
+    // Strategy 1: analytics link contains "X Views"
     const links = document.querySelectorAll('a[href*="/analytics"]');
     for (const link of links) {
         const txt = (link.innerText || link.textContent || "").trim();
         const m = txt.match(/([\\d,\\.]+[KMB]?)\\s*Views/i);
         if (m) return m[1].replace(/,/g, "");
     }
-    // Strategy 2: find "Views" span and grab the preceding number span
+    // Strategy 2: span saying "Views" preceded by number span
     const spans = [...document.querySelectorAll('span')];
     for (let i = 1; i < spans.length; i++) {
         if (/^views$/i.test(spans[i].textContent.trim())) {
@@ -149,30 +171,31 @@ async def fetch_views(sem, context, url, idx, total):
 
 
 async def main():
-    if AUTH_TOKEN == "PASTE_HERE":
-        print("ERROR: Set AUTH_TOKEN at the top of the script first.")
+    channel, profile_path = get_profile_path()
+    if not profile_path:
+        print("ERROR: Could not find a Chrome or Edge profile on this machine.")
+        print("Install Chrome or Edge and log in to x.com, then re-run.")
         return
 
+    print(f"Using profile: {profile_path}")
+    print("NOTE: Make sure your browser is fully closed before continuing.\n")
+
     total = len(URLS)
-    sem = asyncio.Semaphore(4)
+    # Keep concurrency low when using a real profile to avoid instability
+    sem = asyncio.Semaphore(2)
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            )
+        context = await p.chromium.launch_persistent_context(
+            user_data_dir=profile_path,
+            channel=channel,
+            headless=True,
+            args=["--no-first-run", "--no-default-browser-check"],
         )
-        await context.add_cookies([
-            {"name": "auth_token", "value": AUTH_TOKEN, "domain": ".x.com", "path": "/"}
-        ])
 
-        print(f"Fetching {total} tweets (4 at a time)...\n")
+        print(f"Fetching {total} tweets...\n")
         tasks = [fetch_views(sem, context, url, i + 1, total) for i, url in enumerate(URLS)]
         results = await asyncio.gather(*tasks)
-        await browser.close()
+        await context.close()
 
     print("\n" + "=" * 40)
     print("PASTE INTO AIRTABLE:")
