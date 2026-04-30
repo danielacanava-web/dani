@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
-Scrape view counts from X/Twitter URLs and output a CSV.
+Scrape views, likes, comments and reposts from X/Twitter URLs and output a CSV.
 No Airtable connection needed.
 
 Usage:
-    python scrape_views_csv.py urls.txt          # file with one URL per line
+    python scrape_views_csv.py urls.txt
     python scrape_views_csv.py urls.txt -o out.csv
     python scrape_views_csv.py urls.txt --cookies x_cookies.json
-
-The cookies file is a Cookie-Editor JSON export from a logged-in X session.
 """
 
 import argparse
@@ -25,7 +23,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 _DEFAULT_CHROMIUM = "/opt/pw-browsers/chromium_headless_shell-1194/chrome-linux/headless_shell"
 
 
-def parse_views(raw: str) -> Optional[int]:
+def parse_count(raw: str) -> Optional[int]:
     if not raw:
         return None
     cleaned = raw.strip().replace(",", "").replace(" ", "")
@@ -69,61 +67,118 @@ def load_cookies(path: str) -> list:
     return cookies
 
 
-def scrape_x_views(page, url: str) -> Optional[int]:
+def scrape_tweet(page, url: str) -> dict:
+    result = {"views": "", "likes": "", "comments": "", "reposts": ""}
+
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=30_000)
         page.wait_for_selector("article[data-testid='tweet']", timeout=20_000)
     except PlaywrightTimeout:
         print(f"  Timeout: {url}", file=sys.stderr)
-        return None
+        return result
 
+    # --- Views ---
     try:
         view_el = page.query_selector("a[href$='/analytics']")
         if view_el:
             text = view_el.inner_text().strip()
             nums = re.findall(r"[\d,\.]+[KkMmBb]?", text)
             if nums:
-                count = parse_views(nums[0])
-                if count is not None:
-                    return count
+                v = parse_count(nums[0])
+                if v is not None:
+                    result["views"] = v
     except Exception:
         pass
 
+    if not result["views"]:
+        try:
+            content = page.content()
+            m = re.search(r'aria-label="([\d,\.]+[KkMmBb]?)\s*[Vv]iews?"', content)
+            if m:
+                result["views"] = parse_count(m.group(1)) or ""
+            if not result["views"]:
+                m = re.search(r'"views?[_\s]?count"[^:]*:\s*(\d+)', content, re.I)
+                if m:
+                    result["views"] = int(m.group(1))
+        except Exception:
+            pass
+
+    # --- Likes, comments, reposts via aria-labels on action buttons ---
     try:
-        spans = page.query_selector_all("span")
-        for span in spans:
-            text = span.inner_text().strip()
-            if re.search(r"views?", text, re.I) and len(text) < 40:
-                nums = re.findall(r"[\d,\.]+[KkMmBb]?", text)
-                if nums:
-                    count = parse_views(nums[0])
-                    if count is not None:
-                        return count
+        # Reply/comment count
+        reply_el = page.query_selector("[data-testid='reply']")
+        if reply_el:
+            label = reply_el.get_attribute("aria-label") or ""
+            m = re.search(r"([\d,\.]+[KkMmBb]?)\s*repl", label, re.I)
+            if m:
+                result["comments"] = parse_count(m.group(1)) or ""
+            else:
+                span = reply_el.query_selector("span[data-testid='app-text-transition-container']")
+                if span:
+                    t = span.inner_text().strip()
+                    v = parse_count(t)
+                    if v is not None:
+                        result["comments"] = v
+
+        # Repost count
+        repost_el = page.query_selector("[data-testid='retweet']")
+        if repost_el:
+            label = repost_el.get_attribute("aria-label") or ""
+            m = re.search(r"([\d,\.]+[KkMmBb]?)\s*repost", label, re.I)
+            if m:
+                result["reposts"] = parse_count(m.group(1)) or ""
+            else:
+                span = repost_el.query_selector("span[data-testid='app-text-transition-container']")
+                if span:
+                    t = span.inner_text().strip()
+                    v = parse_count(t)
+                    if v is not None:
+                        result["reposts"] = v
+
+        # Like count
+        like_el = page.query_selector("[data-testid='like']")
+        if like_el:
+            label = like_el.get_attribute("aria-label") or ""
+            m = re.search(r"([\d,\.]+[KkMmBb]?)\s*like", label, re.I)
+            if m:
+                result["likes"] = parse_count(m.group(1)) or ""
+            else:
+                span = like_el.query_selector("span[data-testid='app-text-transition-container']")
+                if span:
+                    t = span.inner_text().strip()
+                    v = parse_count(t)
+                    if v is not None:
+                        result["likes"] = v
     except Exception:
         pass
 
+    # --- Fallback: scan aria-labels across the page ---
     try:
-        content = page.content()
-        m = re.search(r'"viewCount"[^}]*"count"\s*:\s*"?([\d,\.]+[KkMmBb]?)"?', content)
-        if m:
-            return parse_views(m.group(1))
-        m = re.search(r'aria-label="([\d,\.]+[KkMmBb]?)\s*[Vv]iews?"', content)
-        if m:
-            return parse_views(m.group(1))
-        m = re.search(r'"views?[_\s]?count"[^:]*:\s*(\d+)', content, re.I)
-        if m:
-            return int(m.group(1))
+        if not result["comments"] or not result["reposts"] or not result["likes"]:
+            content = page.content()
+            if not result["comments"]:
+                m = re.search(r'"reply_count"\s*:\s*(\d+)', content)
+                if m:
+                    result["comments"] = int(m.group(1))
+            if not result["reposts"]:
+                m = re.search(r'"retweet_count"\s*:\s*(\d+)', content)
+                if m:
+                    result["reposts"] = int(m.group(1))
+            if not result["likes"]:
+                m = re.search(r'"favorite_count"\s*:\s*(\d+)', content)
+                if m:
+                    result["likes"] = int(m.group(1))
     except Exception:
         pass
 
-    return None
+    return result
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("urls_file", help="Text file with one X/Twitter URL per line")
-    parser.add_argument("-o", "--output", default="scraped_views.csv", help="Output CSV path (default: scraped_views.csv)")
-    parser.add_argument("--cookies", default="x_cookies.json", help="Path to Cookie-Editor JSON export from X session")
+    parser.add_argument("-o", "--output", default="scraped_views.csv", help="Output CSV (default: scraped_views.csv)")
+    parser.add_argument("--cookies", default="x_cookies.json", help="Cookie-Editor JSON from logged-in X session")
     parser.add_argument("--chromium", default=None, help="Path to Chromium executable")
     args = parser.parse_args()
 
@@ -135,11 +190,11 @@ def main():
 
     cookies = load_cookies(args.cookies)
     if not cookies:
-        print(f"WARNING: No cookies loaded from '{args.cookies}'. Views may not be visible without login.", file=sys.stderr)
+        print(f"WARNING: No cookies loaded from '{args.cookies}'. Metrics may require login.", file=sys.stderr)
 
     chromium_path = args.chromium or os.environ.get("PLAYWRIGHT_CHROMIUM_PATH", _DEFAULT_CHROMIUM)
 
-    results = []
+    rows = []
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
             headless=True,
@@ -153,19 +208,25 @@ def main():
 
         for i, url in enumerate(urls, 1):
             print(f"[{i}/{len(urls)}] {url}", file=sys.stderr)
-            views = scrape_x_views(page, url)
-            results.append((url, views if views is not None else ""))
-            print(f"  -> {views}", file=sys.stderr)
+            metrics = scrape_tweet(page, url)
+            rows.append({
+                "post_url":  url,
+                "views":     metrics["views"],
+                "likes":     metrics["likes"],
+                "comments":  metrics["comments"],
+                "reposts":   metrics["reposts"],
+            })
+            print(f"  views={metrics['views']}  likes={metrics['likes']}  comments={metrics['comments']}  reposts={metrics['reposts']}", file=sys.stderr)
             time.sleep(0.5)
 
         browser.close()
 
     with open(args.output, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["post_url", "post_views"])
-        writer.writerows(results)
+        writer = csv.DictWriter(f, fieldnames=["post_url", "views", "likes", "comments", "reposts"])
+        writer.writeheader()
+        writer.writerows(rows)
 
-    print(f"\nDone. Results saved to {args.output}", file=sys.stderr)
+    print(f"\nDone. Saved to {args.output}", file=sys.stderr)
 
 
 if __name__ == "__main__":
